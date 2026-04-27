@@ -92,4 +92,4 @@ Contributions and ideas are welcome — open an issue or submit a PR.
 
 ## License
 
-MIT
+GPL-3.0
