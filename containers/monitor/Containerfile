@@ -1,0 +1,7 @@
+FROM docker.io/library/python:3.12-slim
+
+WORKDIR /app
+COPY gitops-agent/watchguard_monitor.py /app/watchguard_monitor.py
+COPY config/watchguard.example.json /app/config/watchguard.example.json
+
+ENTRYPOINT ["python", "/app/watchguard_monitor.py"]

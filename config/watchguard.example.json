@@ -1,0 +1,24 @@
+{
+  "device_id": "podman-watchguard-demo",
+  "sample_interval_seconds": 2,
+  "temperature_control": {
+    "fan_on_celsius": 34.0,
+    "fan_off_celsius": 30.0,
+    "critical_celsius": 42.0
+  },
+  "humidity": {
+    "warning_percent": 75.0
+  },
+  "power": {
+    "low_voltage": 4.75,
+    "high_current_ma": 950
+  },
+  "simulation": {
+    "enabled": true,
+    "temperature_celsius": 36.5,
+    "humidity_percent": 61.0,
+    "voltage": 5.05,
+    "current_ma": 420,
+    "tamper_open": false
+  }
+}
