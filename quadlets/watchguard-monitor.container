@@ -1,0 +1,18 @@
+[Unit]
+Description=Podman Watchguard IoT monitor
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+Image=localhost/podman-watchguard-monitor:local
+ContainerName=watchguard-monitor
+Volume=%h/.config/podman-watchguard/watchguard.json:/app/config/watchguard.json:ro
+Exec=--config /app/config/watchguard.json
+AutoUpdate=local
+
+[Service]
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

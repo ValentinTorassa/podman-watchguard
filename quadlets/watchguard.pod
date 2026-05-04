@@ -1,0 +1,10 @@
+[Unit]
+Description=Podman Watchguard service pod
+
+[Pod]
+PodName=watchguard
+PublishPort=51820:51820/udp
+PublishPort=2222:2222/tcp
+
+[Install]
+WantedBy=default.target
