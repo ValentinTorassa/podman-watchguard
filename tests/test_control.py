@@ -1,0 +1,127 @@
+#!/usr/bin/env python3
+"""Control logic tests: fan hysteresis, alerts and the actuator states they produce."""
+
+from __future__ import annotations
+
+import json
+import sys
+from dataclasses import replace
+from pathlib import Path
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "gitops-agent"))
+
+import watchguard_monitor as monitor  # noqa: E402
+
+
+CALM = monitor.SensorReading(
+    temperature_celsius=25.0,
+    humidity_percent=50.0,
+    voltage=5.05,
+    current_ma=420.0,
+    power_mw=2121.0,
+    tamper_open=False,
+)
+
+
+def example_config() -> dict[str, Any]:
+    with (ROOT / "config/watchguard.example.json").open(encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def reading(**changes: Any) -> monitor.SensorReading:
+    return replace(CALM, **changes)
+
+
+def raises(exc_type: type[BaseException], func: Any, *args: Any) -> BaseException:
+    try:
+        func(*args)
+    except exc_type as exc:
+        return exc
+    raise AssertionError(f"{func} did not raise {exc_type.__name__}")
+
+
+def test_calm_cabinet_is_green() -> None:
+    state = monitor.Controller(example_config()).decide(CALM)
+    assert state == monitor.ActuatorState(
+        fan_on=False, buzzer_on=False, led_state="green", relay_reset_requested=False
+    )
+
+
+def test_fan_temperature_hysteresis() -> None:
+    controller = monitor.Controller(example_config())
+    fan = [controller.decide(reading(temperature_celsius=t)).fan_on for t in (33.9, 34.0, 31.0, 30.1, 30.0, 33.0)]
+    assert fan == [False, True, True, True, False, False]
+    assert controller.decide(reading(temperature_celsius=35.0)).led_state == "blue"
+
+
+def test_critical_temperature_alerts_with_fan() -> None:
+    state = monitor.Controller(example_config()).decide(reading(temperature_celsius=42.0))
+    assert (state.fan_on, state.buzzer_on, state.led_state) == (True, True, "red")
+
+
+def test_high_humidity_turns_fan_on_with_hysteresis() -> None:
+    controller = monitor.Controller(example_config())
+    humid = controller.decide(reading(humidity_percent=75.0))
+    assert (humid.fan_on, humid.buzzer_on, humid.led_state) == (True, True, "red")
+    # Below the warning the alert clears, but the fan keeps drying the
+    # cabinet until the humidity is down to fan_off_percent (70 %).
+    drying = controller.decide(reading(humidity_percent=72.0))
+    assert (drying.fan_on, drying.buzzer_on, drying.led_state) == (True, False, "blue")
+    assert controller.decide(reading(humidity_percent=74.9)).fan_on is True
+    dry = controller.decide(reading(humidity_percent=70.0))
+    assert (dry.fan_on, dry.led_state) == (False, "green")
+
+
+def test_fan_stays_on_while_either_variable_needs_it() -> None:
+    controller = monitor.Controller(example_config())
+    controller.decide(reading(temperature_celsius=35.0, humidity_percent=80.0))
+    assert controller.decide(reading(temperature_celsius=29.0, humidity_percent=72.0)).fan_on is True
+    assert controller.decide(reading(temperature_celsius=32.0, humidity_percent=60.0)).fan_on is False
+
+
+def test_humidity_fan_off_defaults_below_warning() -> None:
+    config = example_config()
+    del config["humidity"]["fan_off_percent"]
+    controller = monitor.Controller(config)
+    controller.decide(reading(humidity_percent=76.0))
+    assert controller.decide(reading(humidity_percent=70.1)).fan_on is True
+    assert controller.decide(reading(humidity_percent=70.0)).fan_on is False
+
+
+def test_tamper_sounds_buzzer_and_red_led() -> None:
+    state = monitor.Controller(example_config()).decide(reading(tamper_open=True))
+    assert (state.fan_on, state.buzzer_on, state.led_state) == (False, True, "red")
+
+
+def test_power_alerts_and_reset_request() -> None:
+    controller = monitor.Controller(example_config())
+    low = controller.decide(reading(voltage=4.7))
+    assert (low.buzzer_on, low.relay_reset_requested) == (True, False)
+    high = controller.decide(reading(current_ma=1000.0))
+    assert (high.buzzer_on, high.relay_reset_requested) == (True, False)
+    both = controller.decide(reading(voltage=4.7, current_ma=1000.0))
+    assert (both.buzzer_on, both.relay_reset_requested) == (True, True)
+
+
+def test_controller_rejects_inverted_thresholds() -> None:
+    config = example_config()
+    config["temperature_control"]["fan_off_celsius"] = 36.0
+    raises(ValueError, monitor.Controller, config)
+    config = example_config()
+    config["humidity"]["fan_off_percent"] = 80.0
+    raises(ValueError, monitor.Controller, config)
+
+
+def main() -> int:
+    tests = [value for name, value in globals().items() if name.startswith("test_") and callable(value)]
+    for test in tests:
+        test()
+        print(f"ok - {test.__name__}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

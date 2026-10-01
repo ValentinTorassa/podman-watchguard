@@ -118,30 +118,58 @@ class RaspberryPiBackend(SensorBackend):
 
 
 class Controller:
+    """Decides the actuator states from one reading.
+
+    The fan is an on/off loop with hysteresis on two variables: it turns on at
+    ``fan_on_celsius`` or at the humidity ``warning_percent`` and only turns
+    off once the temperature is back at ``fan_off_celsius`` and the humidity at
+    ``fan_off_percent`` (5 points below the warning if not configured), so it
+    does not flap around either threshold. The alerts (buzzer, red LED) use
+    the plain thresholds.
+    """
+
     def __init__(self, config: dict[str, Any]) -> None:
-        self._config = config
-        self._fan_latched = False
+        control = config["temperature_control"]
+        humidity = config["humidity"]
+        power = config["power"]
+        self._fan_on_celsius = float(control["fan_on_celsius"])
+        self._fan_off_celsius = float(control["fan_off_celsius"])
+        self._critical_celsius = float(control["critical_celsius"])
+        self._humidity_warning = float(humidity["warning_percent"])
+        self._humidity_fan_off = float(humidity.get("fan_off_percent", self._humidity_warning - 5))
+        self._low_voltage = float(power["low_voltage"])
+        self._high_current_ma = float(power["high_current_ma"])
+        if not self._fan_off_celsius < self._fan_on_celsius <= self._critical_celsius:
+            raise ValueError("need fan_off_celsius < fan_on_celsius <= critical_celsius")
+        if not self._humidity_fan_off < self._humidity_warning:
+            raise ValueError("need humidity fan_off_percent < warning_percent")
+        self._thermal_fan = False
+        self._humidity_fan = False
 
     def decide(self, reading: SensorReading) -> ActuatorState:
-        control = self._config["temperature_control"]
-        humidity = self._config["humidity"]
-        power = self._config["power"]
+        temperature = reading.temperature_celsius
+        if temperature >= self._fan_on_celsius:
+            self._thermal_fan = True
+        elif temperature <= self._fan_off_celsius:
+            self._thermal_fan = False
 
-        if reading.temperature_celsius >= float(control["fan_on_celsius"]):
-            self._fan_latched = True
-        elif reading.temperature_celsius <= float(control["fan_off_celsius"]):
-            self._fan_latched = False
+        humidity = reading.humidity_percent
+        if humidity >= self._humidity_warning:
+            self._humidity_fan = True
+        elif humidity <= self._humidity_fan_off:
+            self._humidity_fan = False
 
-        critical = reading.temperature_celsius >= float(control["critical_celsius"])
-        humid = reading.humidity_percent >= float(humidity["warning_percent"])
-        low_voltage = reading.voltage <= float(power["low_voltage"])
-        high_current = reading.current_ma >= float(power["high_current_ma"])
+        fan = self._thermal_fan or self._humidity_fan
+        critical = temperature >= self._critical_celsius
+        humid = humidity >= self._humidity_warning
+        low_voltage = reading.voltage <= self._low_voltage
+        high_current = reading.current_ma >= self._high_current_ma
         alert = critical or humid or low_voltage or high_current or reading.tamper_open
 
         return ActuatorState(
-            fan_on=self._fan_latched,
+            fan_on=fan,
             buzzer_on=alert,
-            led_state="red" if alert else ("blue" if self._fan_latched else "green"),
+            led_state="red" if alert else ("blue" if fan else "green"),
             relay_reset_requested=low_voltage and high_current,
         )
 

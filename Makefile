@@ -3,6 +3,7 @@
 test:
 	python3 tests/test_project.py
 	python3 tests/test_hardware.py
+	python3 tests/test_control.py
 
 docs:
 	./scripts/generate-pdf.sh docs/proyecto.md docs/proyecto.pdf
