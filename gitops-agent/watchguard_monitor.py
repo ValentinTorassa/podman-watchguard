@@ -1,32 +1,40 @@
 #!/usr/bin/env python3
 """Podman Watchguard sensor and actuator monitor.
 
-The production target is a Raspberry Pi Zero 2 W with GPIO/I2C sensors, read
-by the drivers in watchguard_hardware.py. The default mode is simulation so the
-container and tests can run on a laptop.
+The production target is a Raspberry Pi Zero 2 W with GPIO/I2C sensors and
+GPIO actuators, driven by watchguard_hardware.py. The default mode is
+simulation so the container and tests can run on a laptop: sensor values come
+from the config and the actuator decisions are reported but not driven.
 
-Actuator states are decided and reported in the JSON telemetry; driving the
-fan, LED, buzzer and relay GPIO outputs is not implemented yet.
+Every cycle reads the sensors, decides the actuator states, drives them and
+prints one JSON event. On any exit (end of --iterations, SIGTERM, an
+unexpected error) every actuator is de-energized before the GPIO lines are
+released.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import random
+import signal
 import sys
 import time
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Callable, Iterator, Mapping
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
 from watchguard_hardware import (
+    ActuatorError,
     ClimateSensor,
+    Outputs,
     PowerSensor,
     SensorError,
     TamperSensor,
     build_climate_sensor,
+    build_gpio_outputs,
     build_power_sensor,
     build_tamper_sensor,
 )
@@ -50,6 +58,13 @@ class ActuatorState:
     relay_reset_requested: bool
     relay_on: bool
     relay_phase: str
+
+
+@dataclass(frozen=True)
+class Decision:
+    actuators: ActuatorState
+    # Names of the conditions that raised the alert (buzzer, red LED).
+    alerts: tuple[str, ...]
 
 
 class SensorBackend:
@@ -224,7 +239,7 @@ class Controller:
         self._thermal_fan = False
         self._humidity_fan = False
 
-    def decide(self, reading: SensorReading) -> ActuatorState:
+    def decide(self, reading: SensorReading) -> Decision:
         temperature = reading.temperature_celsius
         if temperature >= self._fan_on_celsius:
             self._thermal_fan = True
@@ -238,22 +253,72 @@ class Controller:
             self._humidity_fan = False
 
         fan = self._thermal_fan or self._humidity_fan
-        critical = temperature >= self._critical_celsius
-        humid = humidity >= self._humidity_warning
-        low_voltage = reading.voltage <= self._low_voltage
-        high_current = reading.current_ma >= self._high_current_ma
-        alert = critical or humid or low_voltage or high_current or reading.tamper_open
-        reset_requested = low_voltage and high_current
+        conditions = {
+            "temperature_critical": temperature >= self._critical_celsius,
+            "humidity_high": humidity >= self._humidity_warning,
+            "low_voltage": reading.voltage <= self._low_voltage,
+            "high_current": reading.current_ma >= self._high_current_ma,
+            "tamper": reading.tamper_open,
+        }
+        alerts = tuple(name for name, active in conditions.items() if active)
+        reset_requested = conditions["low_voltage"] and conditions["high_current"]
         relay_phase = self._relay.update(reset_requested, self._clock())
 
-        return ActuatorState(
+        actuators = ActuatorState(
             fan_on=fan,
-            buzzer_on=alert,
-            led_state="red" if alert else ("blue" if fan else "green"),
+            buzzer_on=bool(alerts),
+            led_state="red" if alerts else ("blue" if fan else "green"),
             relay_reset_requested=reset_requested,
             relay_on=relay_phase == RelaySequencer.POWER_CUT,
             relay_phase=relay_phase,
         )
+        return Decision(actuators, alerts)
+
+    def fault(self) -> Decision:
+        """Decide for a cycle without a valid reading.
+
+        The relay is released at once: no power cut without a fresh
+        measurement. The fan is latched on, as if the cabinet were hot, until a
+        valid reading is back at the fan-off thresholds. The LED turns red to
+        show the fault. The buzzer stays quiet: it is kept for the conditions
+        in the report, and DHT22 read failures are common enough to make it a
+        nuisance.
+        """
+        self._thermal_fan = True
+        actuators = ActuatorState(
+            fan_on=True,
+            buzzer_on=False,
+            led_state="red",
+            relay_reset_requested=False,
+            relay_on=False,
+            relay_phase=self.release_relay(),
+        )
+        return Decision(actuators, ("sensor_error",))
+
+    def release_relay(self) -> str:
+        """Abort any relay sequence; used when the outputs could not be driven."""
+        return self._relay.abort(self._clock())
+
+
+class SimulatedOutputs:
+    """Simulation mode drives no GPIO; the decisions are only reported."""
+
+    def write(self, levels: Mapping[str, bool]) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
+LED_COLOURS = ("green", "blue", "red")
+
+
+def output_levels(actuators: ActuatorState) -> dict[str, bool]:
+    """Map actuator states onto the outputs named in watchguard_hardware."""
+    levels = {"fan": actuators.fan_on, "buzzer": actuators.buzzer_on, "relay": actuators.relay_on}
+    for colour in LED_COLOURS:
+        levels[f"led_{colour}"] = actuators.led_state == colour
+    return levels
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -268,19 +333,63 @@ def build_backend(config: dict[str, Any]) -> SensorBackend:
     return RaspberryPiBackend(config)
 
 
-def emit_error(device_id: str, error: Exception) -> None:
-    event = {"device_id": device_id, "timestamp": int(time.time()), "error": str(error)}
+def build_outputs(config: dict[str, Any]) -> Outputs:
+    simulation = config.get("simulation", {})
+    if simulation.get("enabled", True):
+        return SimulatedOutputs()
+    return build_gpio_outputs(config.get("hardware", {}))
+
+
+def emit(device_id: str, fields: dict[str, Any]) -> None:
+    event = {"device_id": device_id, "timestamp": int(time.time()), **fields}
     print(json.dumps(event, sort_keys=True), flush=True)
 
 
-def emit_event(device_id: str, reading: SensorReading, actuators: ActuatorState) -> None:
-    event = {
-        "device_id": device_id,
-        "timestamp": int(time.time()),
-        "reading": reading.__dict__,
-        "actuators": actuators.__dict__,
-    }
-    print(json.dumps(event, sort_keys=True), flush=True)
+def run_cycle(backend: SensorBackend, controller: Controller, outputs: Outputs, device_id: str) -> None:
+    """Read, decide, drive the outputs and emit one event."""
+    fields: dict[str, Any]
+    try:
+        reading = backend.read()
+    except SensorError as exc:
+        # A failed read is reported and retried on the next cycle instead of
+        # crashing the service; meanwhile the outputs take the fault state.
+        decision = controller.fault()
+        fields = {"error": str(exc)}
+    else:
+        decision = controller.decide(reading)
+        fields = {"reading": asdict(reading)}
+    fields["alerts"] = list(decision.alerts)
+    try:
+        outputs.write(output_levels(decision.actuators))
+    except ActuatorError as exc:
+        # The driver has already tried to de-energize every output and
+        # released the lines; drop any relay sequence and retry next cycle.
+        controller.release_relay()
+        fields["actuator_error"] = str(exc)
+    else:
+        fields["actuators"] = asdict(decision.actuators)
+    emit(device_id, fields)
+
+
+@contextlib.contextmanager
+def exit_on_sigterm() -> Iterator[None]:
+    """Turn SIGTERM into SystemExit so that cleanup runs.
+
+    ``podman stop`` and ``systemctl stop`` send SIGTERM. Python's default
+    action ends the process without unwinding, and as PID 1 of the container
+    the monitor does not even get the default action, so podman would wait
+    for its timeout and SIGKILL it with the actuators still driven.
+    """
+
+    def stop(signum: int, frame: Any) -> None:
+        raise SystemExit(0)
+
+    previous = signal.signal(signal.SIGTERM, stop)
+    try:
+        yield
+    finally:
+        if previous is not None:
+            signal.signal(signal.SIGTERM, previous)
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -293,28 +402,24 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv or sys.argv[1:])
     config = load_config(Path(args.config))
-    backend = build_backend(config)
     controller = Controller(config)
     interval = float(config.get("sample_interval_seconds", 2))
     iterations = 0
 
-    try:
+    with contextlib.ExitStack() as cleanup:
+        cleanup.enter_context(exit_on_sigterm())
+        backend = build_backend(config)
+        cleanup.callback(backend.close)
+        outputs = build_outputs(config)
+        # Registered last so it runs first: the actuators are de-energized
+        # before anything else is released, whatever ends the loop.
+        cleanup.callback(outputs.close)
         while True:
-            try:
-                reading = backend.read()
-            except SensorError as exc:
-                # A failed read is reported and retried on the next cycle
-                # instead of crashing the service.
-                emit_error(config["device_id"], exc)
-            else:
-                actuators = controller.decide(reading)
-                emit_event(config["device_id"], reading, actuators)
+            run_cycle(backend, controller, outputs, config["device_id"])
             iterations += 1
             if args.iterations and iterations >= args.iterations:
                 return 0
             time.sleep(interval)
-    finally:
-        backend.close()
 
 
 if __name__ == "__main__":

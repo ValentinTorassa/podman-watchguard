@@ -7,8 +7,10 @@ import contextlib
 import enum
 import io
 import json
+import signal
 import sys
 import tempfile
+from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -368,12 +370,12 @@ def test_raspberry_pi_backend_composes_reading() -> None:
     )
 
 
-def run_monitor(config: dict[str, Any], tmp: Path) -> list[dict[str, Any]]:
+def run_monitor(config: dict[str, Any], tmp: Path, iterations: int = 1) -> list[dict[str, Any]]:
     config_path = tmp / "watchguard.json"
     config_path.write_text(json.dumps(config), encoding="utf-8")
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
-        assert monitor.main(["--config", str(config_path), "--iterations", "1"]) == 0
+        assert monitor.main(["--config", str(config_path), "--iterations", str(iterations)]) == 0
     return [json.loads(line) for line in out.getvalue().splitlines()]
 
 
@@ -386,21 +388,29 @@ def pi_config(sysfs: Path) -> dict[str, Any]:
     return config
 
 
-def test_monitor_reads_hardware_end_to_end() -> None:
-    gpiod = fake_gpiod(FakeValue.ACTIVE)
+@contextlib.contextmanager
+def installed_gpiod(module: SimpleNamespace) -> Iterator[SimpleNamespace]:
     saved = sys.modules.get("gpiod")
-    sys.modules["gpiod"] = gpiod  # type: ignore[assignment]
+    sys.modules["gpiod"] = module  # type: ignore[assignment]
     try:
-        with tempfile.TemporaryDirectory() as tmp:
-            sysfs = Path(tmp) / "sys"
-            make_dht(sysfs, temp="36000", humidity="50000")
-            make_ina219_hwmon(sysfs, bus_mv="5050", curr_ma="4100", shunt_uohm="10000")
-            [event] = run_monitor(pi_config(sysfs), Path(tmp))
+        yield module
     finally:
         if saved is None:
             sys.modules.pop("gpiod", None)
         else:
             sys.modules["gpiod"] = saved
+
+
+def requests_by_line(gpiod: SimpleNamespace) -> dict[int, FakeRequest]:
+    return {line: request for call, request in zip(gpiod.calls, gpiod.requests) for line in call["config"]}
+
+
+def test_monitor_reads_hardware_end_to_end() -> None:
+    with installed_gpiod(fake_gpiod(FakeValue.ACTIVE)) as gpiod, tempfile.TemporaryDirectory() as tmp:
+        sysfs = Path(tmp) / "sys"
+        make_dht(sysfs, temp="36000", humidity="50000")
+        make_ina219_hwmon(sysfs, bus_mv="5050", curr_ma="4100", shunt_uohm="10000")
+        [event] = run_monitor(pi_config(sysfs), Path(tmp))
     assert event["reading"] == {
         "temperature_celsius": 36.0,
         "humidity_percent": 50.0,
@@ -409,18 +419,83 @@ def test_monitor_reads_hardware_end_to_end() -> None:
         "power_mw": 2070.5,
         "tamper_open": True,
     }
+    assert event["alerts"] == ["tamper"]
     assert event["actuators"]["fan_on"] is True
     assert event["actuators"]["buzzer_on"] is True
-    assert gpiod.requests[0].released, "monitor should release the GPIO line on exit"
+    lines = requests_by_line(gpiod)
+    assert lines[17].released, "monitor should release the reed switch line on exit"
+    outputs = lines[27]
+    # Fan (27), buzzer (18) and red LED (24) on; green (22), blue (23) and relay (25) off.
+    assert outputs.writes[0] == {
+        27: FakeValue.ACTIVE,
+        18: FakeValue.ACTIVE,
+        25: FakeValue.INACTIVE,
+        22: FakeValue.INACTIVE,
+        23: FakeValue.INACTIVE,
+        24: FakeValue.ACTIVE,
+    }
+    assert outputs.writes[-1] == ALL_INACTIVE, "monitor should de-energize the actuators on exit"
+    assert outputs.released
 
 
 def test_monitor_reports_sensor_errors_without_crashing() -> None:
-    with tempfile.TemporaryDirectory() as tmp:
+    with installed_gpiod(fake_gpiod(FakeValue.INACTIVE)) as gpiod, tempfile.TemporaryDirectory() as tmp:
         sysfs = Path(tmp) / "empty-sys"
         sysfs.mkdir()
         [event] = run_monitor(pi_config(sysfs), Path(tmp))
     assert "reading" not in event
     assert "dht11" in event["error"]
+    assert event["actuators"]["fan_on"] is True
+    assert event["actuators"]["relay_on"] is False
+    outputs = requests_by_line(gpiod)[27]
+    assert outputs.writes[0][27] == FakeValue.ACTIVE
+    assert outputs.writes[-1] == ALL_INACTIVE
+
+
+def test_monitor_reports_missing_gpio_chip_and_keeps_running() -> None:
+    gpiod = fake_gpiod(FakeValue.INACTIVE)
+
+    def missing_chip(*args: Any, **kwargs: Any) -> None:
+        raise FileNotFoundError(2, "No such file or directory", "/dev/gpiochip0")
+
+    gpiod.request_lines = missing_chip
+    with installed_gpiod(gpiod), tempfile.TemporaryDirectory() as tmp:
+        sysfs = Path(tmp) / "empty-sys"
+        sysfs.mkdir()
+        config = pi_config(sysfs)
+        config["sample_interval_seconds"] = 0
+        events = run_monitor(config, Path(tmp), iterations=2)
+    assert len(events) == 2
+    assert all("/dev/gpiochip0" in event["actuator_error"] for event in events)
+    assert all("actuators" not in event for event in events)
+
+
+def test_monitor_goes_safe_on_sigterm() -> None:
+    def sigterm_instead_of_sleeping(seconds: float) -> None:
+        assert signal.getsignal(signal.SIGTERM) is not signal.SIG_DFL, "SIGTERM would kill the test run"
+        signal.raise_signal(signal.SIGTERM)
+
+    handler_before = signal.getsignal(signal.SIGTERM)
+    with installed_gpiod(fake_gpiod(FakeValue.ACTIVE)) as gpiod, tempfile.TemporaryDirectory() as tmp:
+        sysfs = Path(tmp) / "sys"
+        make_dht(sysfs, temp="43000", humidity="80000")
+        make_ina219_hwmon(sysfs, bus_mv="4600", curr_ma="10000", shunt_uohm="10000")
+        config_path = Path(tmp) / "watchguard.json"
+        config_path.write_text(json.dumps(pi_config(sysfs)), encoding="utf-8")
+        saved_sleep = monitor.time.sleep
+        monitor.time.sleep = sigterm_instead_of_sleeping  # type: ignore[assignment]
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                error = raises(SystemExit, monitor.main, ["--config", str(config_path)])
+        finally:
+            monitor.time.sleep = saved_sleep  # type: ignore[assignment]
+    assert isinstance(error, SystemExit) and error.code == 0
+    assert signal.getsignal(signal.SIGTERM) is handler_before, "the SIGTERM handler should be restored"
+    lines = requests_by_line(gpiod)
+    outputs = lines[27]
+    assert outputs.writes[0][27] == FakeValue.ACTIVE
+    assert outputs.writes[-1] == ALL_INACTIVE
+    assert outputs.released and lines[17].released
 
 
 def main() -> int:
