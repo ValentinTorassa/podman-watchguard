@@ -1,0 +1,4 @@
+# Only needed by the Raspberry Pi backend ("simulation": {"enabled": false}).
+# gpiod is the libgpiod v2 binding; Debian bookworm's python3-libgpiod is v1.
+gpiod==2.5.0
+smbus2==0.6.1

@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """Podman Watchguard sensor and actuator monitor.
 
-The production target is a Raspberry Pi Zero 2 W with GPIO/I2C sensors.
-The default mode is simulation so the container and tests can run on a laptop.
+The production target is a Raspberry Pi Zero 2 W with GPIO/I2C sensors, read
+by the drivers in watchguard_hardware.py. The default mode is simulation so the
+container and tests can run on a laptop.
+
+Actuator states are decided and reported in the JSON telemetry; driving the
+fan, LED, buzzer and relay GPIO outputs is not implemented yet.
 """
 
 from __future__ import annotations
@@ -15,6 +19,16 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from watchguard_hardware import (
+    ClimateSensor,
+    PowerSensor,
+    SensorError,
+    TamperSensor,
+    build_climate_sensor,
+    build_power_sensor,
+    build_tamper_sensor,
+)
 
 
 @dataclass(frozen=True)
@@ -38,6 +52,9 @@ class SensorBackend:
     def read(self) -> SensorReading:
         raise NotImplementedError
 
+    def close(self) -> None:
+        """Release hardware handles; nothing to do by default."""
+
 
 class SimulationBackend(SensorBackend):
     def __init__(self, config: dict[str, Any]) -> None:
@@ -58,15 +75,40 @@ class SimulationBackend(SensorBackend):
 
 
 class RaspberryPiBackend(SensorBackend):
-    def __init__(self, config: dict[str, Any]) -> None:
-        self._config = config
+    """Reads the deployed sensors; configured by the ``hardware`` config section.
+
+    DHT22 via the kernel IIO driver, INA219 via smbus2 or the hwmon driver and
+    the reed switch via libgpiod. See watchguard_hardware.py for the details.
+    """
+
+    def __init__(
+        self,
+        config: dict[str, Any],
+        climate: ClimateSensor | None = None,
+        power: PowerSensor | None = None,
+        tamper: TamperSensor | None = None,
+    ) -> None:
+        hardware = config.get("hardware", {})
+        self._climate = climate if climate is not None else build_climate_sensor(hardware)
+        self._power = power if power is not None else build_power_sensor(hardware)
+        self._tamper = tamper if tamper is not None else build_tamper_sensor(hardware)
 
     def read(self) -> SensorReading:
-        raise RuntimeError(
-            "GPIO/I2C backend is a hardware integration point. "
-            "Install adafruit-circuitpython-dht and adafruit-circuitpython-ina219 "
-            "on the Raspberry Pi, then implement this backend for the deployed pins."
+        temperature, humidity = self._climate.read()
+        voltage, current_ma = self._power.read()
+        return SensorReading(
+            temperature_celsius=round(temperature, 2),
+            humidity_percent=round(humidity, 2),
+            voltage=round(voltage, 3),
+            current_ma=round(current_ma, 1),
+            tamper_open=self._tamper.read(),
         )
+
+    def close(self) -> None:
+        for sensor in (self._climate, self._power, self._tamper):
+            close = getattr(sensor, "close", None)
+            if close is not None:
+                close()
 
 
 class Controller:
@@ -110,6 +152,11 @@ def build_backend(config: dict[str, Any]) -> SensorBackend:
     return RaspberryPiBackend(config)
 
 
+def emit_error(device_id: str, error: Exception) -> None:
+    event = {"device_id": device_id, "timestamp": int(time.time()), "error": str(error)}
+    print(json.dumps(event, sort_keys=True), flush=True)
+
+
 def emit_event(device_id: str, reading: SensorReading, actuators: ActuatorState) -> None:
     event = {
         "device_id": device_id,
@@ -135,14 +182,23 @@ def main(argv: list[str] | None = None) -> int:
     interval = float(config.get("sample_interval_seconds", 2))
     iterations = 0
 
-    while True:
-        reading = backend.read()
-        actuators = controller.decide(reading)
-        emit_event(config["device_id"], reading, actuators)
-        iterations += 1
-        if args.iterations and iterations >= args.iterations:
-            return 0
-        time.sleep(interval)
+    try:
+        while True:
+            try:
+                reading = backend.read()
+            except SensorError as exc:
+                # A failed read is reported and retried on the next cycle
+                # instead of crashing the service.
+                emit_error(config["device_id"], exc)
+            else:
+                actuators = controller.decide(reading)
+                emit_event(config["device_id"], reading, actuators)
+            iterations += 1
+            if args.iterations and iterations >= args.iterations:
+                return 0
+            time.sleep(interval)
+    finally:
+        backend.close()
 
 
 if __name__ == "__main__":

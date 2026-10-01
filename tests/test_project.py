@@ -25,6 +25,8 @@ def test_required_files() -> None:
         "config/watchguard.example.json",
         "containers/monitor/Containerfile",
         "gitops-agent/watchguard_monitor.py",
+        "gitops-agent/watchguard_hardware.py",
+        "gitops-agent/requirements.txt",
         "quadlets/watchguard-monitor.container",
         "quadlets/watchguard.pod",
         "scripts/install-podman-macos.sh",

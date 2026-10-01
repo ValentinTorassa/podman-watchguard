@@ -20,5 +20,27 @@
     "voltage": 5.05,
     "current_ma": 420,
     "tamper_open": false
+  },
+  "hardware": {
+    "sysfs_root": "/sys",
+    "climate": {
+      "driver": "iio",
+      "iio_name": "dht11",
+      "attempts": 3,
+      "retry_delay_seconds": 2.0
+    },
+    "power": {
+      "driver": "smbus",
+      "i2c_bus": 1,
+      "i2c_address": "0x40",
+      "hwmon_name": "ina219",
+      "shunt_ohms": 0.1
+    },
+    "tamper": {
+      "gpio_chip": "/dev/gpiochip0",
+      "gpio_line": 17,
+      "bias": "pull-up",
+      "open_level": "high"
+    }
   }
 }
