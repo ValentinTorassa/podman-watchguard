@@ -2,26 +2,26 @@
 
 Fecha: 2026-10-01.
 
-Este documento compara lo que afirman `docs/proyecto.md` y `docs/test-report.md` con lo que hace el codigo del repositorio. No modifica el informe: cada correccion de texto queda propuesta para aplicarla a mano antes de CACIC.
+Este documento compara lo que afirman `docs/proyecto.md` y `docs/test-report.md` con lo que hace el codigo del repositorio. La primera version de este documento no modificaba el informe: cada correccion de texto quedaba propuesta para aplicarla a mano antes de CACIC. El mismo 2026-10-01 se aplicaron en `docs/proyecto.md` las que marca la columna "Aplicado" del resumen. Los numeros de linea citados abajo corresponden a la version del informe anterior a esos cambios.
 
 Aviso que vale para todo lo que sigue: el backend de hardware (sensores y actuadores) esta probado solamente con dispositivos simulados. `make test` corre 51 pruebas con arboles sysfs falsos, un bus I2C falso y un modulo `gpiod` falso, y todas pasan; nada se ejecuto todavia en una Raspberry Pi con el circuito armado. El informe no debe presentar mediciones ni pruebas sobre hardware real.
 
 ## Resumen
 
-| # | Lo que dice el informe | Estado en el codigo | Que hay que hacer |
-|---|---|---|---|
-| 1 | Raspberry Pi OS Lite Bookworm | No funciona: Bookworm trae Podman 4.3.1, sin Quadlet | Corregir el texto |
-| 2 | Ventilador, LED, buzzer y rele se accionan | Cierto en el codigo, sin probar en hardware | Nada obligatorio (ver 9) |
-| 3 | Rele con retardo de seguridad | Cierto en el codigo; los valores los elige el repositorio | Opcional: dar los valores |
-| 4 | Humedad alta enciende el ventilador | Cierto en el codigo, con histeresis | Opcional: ajustar la tabla de actuadores |
-| 5 | INA219 mide potencia | Cierto: se informa `power_mw` | Nada |
-| 6 | Riesgo: "el backend GPIO/I2C debe implementarse" | Desactualizado | Corregir el texto |
-| 7 | Actualizacion por imagenes/quadlets | A medias: imagenes automaticas, quadlets a mano | Corregir el texto |
-| 8 | Prueba con Podman | Nunca llego a correr | Correrla o corregir el texto |
-| 9 | Buzzer con salida PWM | El codigo lo prende y apaga; el buzzer de la lista de materiales es pasivo | Cambiar la pieza o el texto |
-| 10 | Energia anomala = baja tension y corriente alta | La alerta salta con cualquiera de las dos; el rele exige ambas | Ajustar el texto |
+| # | Lo que dice el informe | Estado en el codigo | Que hay que hacer | Aplicado (2026-10-01) |
+|---|---|---|---|---|
+| 1 | Raspberry Pi OS Lite Bookworm | No funciona: Bookworm trae Podman 4.3.1, sin Quadlet | Corregir el texto | Si |
+| 2 | Ventilador, LED, buzzer y rele se accionan | Cierto en el codigo, sin probar en hardware | Nada obligatorio (ver 9) | No (no hacia falta) |
+| 3 | Rele con retardo de seguridad | Cierto en el codigo; los valores los elige el repositorio | Opcional: dar los valores | No (sigue opcional) |
+| 4 | Humedad alta enciende el ventilador | Cierto en el codigo, con histeresis | Opcional: ajustar la tabla de actuadores | Si, tambien en "Logica de control" |
+| 5 | INA219 mide potencia | Cierto: se informa `power_mw` | Nada | No hacia falta |
+| 6 | Riesgo: "el backend GPIO/I2C debe implementarse" | Desactualizado | Corregir el texto | Si |
+| 7 | Actualizacion por imagenes/quadlets | A medias: imagenes automaticas, quadlets a mano | Corregir el texto | Si, con la aclaracion sobre `gitops-agent/` |
+| 8 | Prueba con Podman | No habia corrido; corrio el 2026-10-01 dentro de un contenedor, fuera de la Pi | Correrla o corregir el texto | Si: se corrio y el texto lo registra |
+| 9 | Buzzer con salida PWM | El codigo lo prende y apaga; el buzzer de la lista de materiales era pasivo | Cambiar la pieza o el texto | Si: buzzer activo |
+| 10 | Energia anomala = baja tension y corriente alta | La alerta salta con cualquiera de las dos; el rele exige ambas | Ajustar el texto | Si |
 
-Los puntos 1, 6, 7 y 8 son errores del texto y hay que corregirlos. Los puntos 9 y 10 aparecieron al revisar y tambien conviene corregirlos.
+Los puntos 1, 6, 7 y 8 son errores del texto y hay que corregirlos. Los puntos 9 y 10 aparecieron al revisar y tambien conviene corregirlos. Al 2026-10-01 estan aplicados 1, 4, 6, 7, 8, 9 y 10; quedan sin aplicar el 2 y el 3, y el 5 no necesitaba cambios.
 
 ## 1. Sistema operativo: Bookworm no sirve
 
@@ -74,6 +74,8 @@ El evento informa la fase en `actuators.relay_phase` (`idle`, `armed`, `power_cu
 
 > | Ventilador 5 V | Extrae calor y humedad del gabinete | Temperatura o humedad por encima del umbral configurado, con histeresis (34/30 °C y 75/70 %). |
 
+**Aplicado (2026-10-01):** la fila de la linea 33 quedo con este texto. Para que "Logica de control" no contradiga la tabla, ahi se agrego la histeresis de humedad (75/70 %) y la regla de que el ventilador queda encendido mientras la temperatura o la humedad lo pida; la linea 19 dice ahora "segun la temperatura y la humedad".
+
 ## 5. Potencia del INA219: implementado
 
 **Informe:** linea 26 ("Voltaje, corriente y potencia DC").
@@ -104,6 +106,8 @@ No hace falta corregir el texto.
 
 Si el informe nombra la carpeta `gitops-agent/`, conviene aclarar que contiene el monitor y no un agente GitOps.
 
+**Aplicado (2026-10-01):** la linea 77 quedo con el texto sugerido, y en la linea 85, que nombra `gitops-agent/watchguard_monitor.py`, se agrego: "Pese al nombre, la carpeta `gitops-agent/` contiene solo el monitor, no un agente GitOps."
+
 ## 8. La prueba con Podman nunca corrio
 
 **Informe:** linea 182: "La prueba con Podman construye la imagen `podman-watchguard-monitor:local` y ejecuta tres iteraciones del monitor con sensores simulados."
@@ -120,6 +124,13 @@ Si el informe nombra la carpeta `gitops-agent/`, conviene aclarar que contiene e
 
 > El repositorio incluye pruebas locales en `tests/` (`make test`): verificaciones del repositorio en `tests/test_project.py`, pruebas del backend de hardware con dispositivos simulados en `tests/test_hardware.py` y pruebas de la logica de control en `tests/test_control.py`:
 
+**Aplicado (2026-10-01): la prueba se corrio.** Podman no esta instalado en las maquinas Linux disponibles, asi que se ejecuto dentro de un contenedor: imagen `quay.io/podman/stable` (Podman 5.8.7 sobre Fedora 44), con `--privileged`, sobre Docker 29.8.1 rootless, en una PC de escritorio x86_64 con Debian 13 (kernel 6.12). Adentro del contenedor Podman corrio como root, con almacenamiento overlay y cgroups v2. Se usaron los comandos de los objetivos `podman-build` y `podman-smoke` del `Makefile`:
+
+- `podman build -t podman-watchguard-monitor:local -f containers/monitor/Containerfile .`: los 7 pasos terminaron bien (instalo `gpiod` 2.5.0 y `smbus2` 0.6.1), imagen de 133 MB, codigo de salida 0.
+- `podman run --rm -v ./config:/config:ro podman-watchguard-monitor:local --config /config/watchguard.example.json --iterations 3`: tres eventos JSON, uno cada 2 s, y codigo de salida 0. Con la simulacion de la configuracion de ejemplo (36.2 a 36.7 °C, 60.5 a 61.9 % de humedad, 5.03 a 5.05 V, 422 a 435 mA) los tres muestran ventilador encendido, LED azul, buzzer y rele apagados, y ninguna alerta.
+
+Esto prueba la imagen y el flujo con contenedores, no el hardware ni el despliegue con quadlets: no corrio en la Raspberry Pi, ni sobre arm64, ni con Podman rootless. En `docs/proyecto.md` la linea 182 ahora registra esta corrida, y se aplico la correccion de la linea 166, con dos items nuevos en la lista para las pruebas de hardware y de control. `docs/test-report.md` no se modifico: su registro del 2026-05-04 en macOS sigue siendo correcto para esa fecha.
+
 ## 9. Buzzer: el codigo no genera PWM y el buzzer de la lista es pasivo
 
 **Informe:** linea 127 ("Salida PWM mediante transistor"), linea 64 de la lista de materiales y referencia de la linea 202 (Adafruit 160, USD 1.50).
@@ -132,6 +143,8 @@ Si el informe nombra la carpeta `gitops-agent/`, conviene aclarar que contiene e
 **Correccion sugerida (linea 127), con buzzer activo:**
 
 > | Buzzer | GPIO18, pin 12 | Salida digital on/off mediante transistor; buzzer activo, con oscilador interno. |
+
+**Aplicado (2026-10-01): se eligio el buzzer activo** y el codigo no cambio. En `docs/proyecto.md`, la linea 127 quedo con el texto sugerido; el actuador de la linea 35 y la pieza de la linea 64 pasaron a "Buzzer activo 5 V"; el diagrama dice "buzzer activo"; y la referencia de la linea 202 es ahora el Adafruit 1536 ("Buzzer 5V - Breadboard friendly", piezo con oscilador interno de 2 kHz, de 3 a 5 V, USD 0.95, precio consultado el 2026-10-01). `docs/bill_of_materials.csv` tiene la misma pieza y el mismo precio. Al recalcular el total aparecio un error previo: las partidas sumaban USD 77.29, no los USD 78.29 que decia el informe. Con el buzzer nuevo el total es USD 76.74, en el informe y en el CSV.
 
 ## 10. Energia anomala: alerta con una condicion, rele con las dos
 

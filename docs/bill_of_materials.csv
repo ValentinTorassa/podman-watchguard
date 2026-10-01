@@ -7,8 +7,8 @@ INA219 current sensor,1,9.95,9.95
 Magnetic reed switch,1,3.95,3.95
 5 V 40 mm fan,1,3.95,3.95
 5 V relay module,1,6.99,6.99
-Piezo buzzer,1,1.50,1.50
+Active 5 V buzzer (built-in oscillator),1,0.95,0.95
 LEDs and resistors,1,1.00,1.00
 MOSFET/transistor/diode/wiring lot,1,5.00,5.00
 3D printed enclosure,1,6.00,6.00
-TOTAL,,,78.29
+TOTAL,,,76.74
