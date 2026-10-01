@@ -76,6 +76,7 @@ class FakeValue(enum.Enum):
 
 class FakeDirection(enum.Enum):
     INPUT = 2
+    OUTPUT = 3
 
 
 class FakeBias(enum.Enum):
@@ -94,12 +95,28 @@ class FakeRequest:
     def __init__(self, value: FakeValue) -> None:
         self.value = value
         self.released = False
+        self.writes: list[dict[int, FakeValue]] = []
+        self.failing_writes = 0
 
     def get_value(self, offset: int) -> FakeValue:
         return self.value
 
+    def set_values(self, values: dict[int, FakeValue]) -> None:
+        assert not self.released, "write on a released request"
+        if self.failing_writes:
+            self.failing_writes -= 1
+            raise OSError(5, "Input/output error")
+        self.writes.append(dict(values))
+
     def release(self) -> None:
         self.released = True
+
+    def levels(self) -> dict[int, FakeValue]:
+        """Current value of every written line."""
+        current: dict[int, FakeValue] = {}
+        for values in self.writes:
+            current.update(values)
+        return current
 
 
 def fake_gpiod(value: FakeValue) -> SimpleNamespace:
@@ -240,6 +257,89 @@ def test_gpiod_errors_become_sensor_errors() -> None:
 
     gpiod.request_lines = missing_chip
     raises(hw.SensorError, hw.GpiodTamperSwitch(chip="/dev/gpiochip9", gpiod_module=gpiod).read)
+
+
+ALL_OUTPUT_LINES = [18, 22, 23, 24, 25, 27]
+ALL_INACTIVE = dict.fromkeys(ALL_OUTPUT_LINES, FakeValue.INACTIVE)
+
+
+def test_gpiod_outputs_request_documented_lines_inactive() -> None:
+    gpiod = fake_gpiod(FakeValue.INACTIVE)
+    outputs = hw.GpiodOutputs(active_low=["relay"], gpiod_module=gpiod)
+    outputs.write({"fan": True, "led_blue": True, "relay": False})
+    [call] = gpiod.calls
+    assert call["path"] == "/dev/gpiochip0"
+    assert call["consumer"] == "watchguard-monitor"
+    config = call["config"]
+    assert sorted(config) == ALL_OUTPUT_LINES
+    assert config[27].kwargs == {
+        "direction": FakeDirection.OUTPUT,
+        "output_value": FakeValue.INACTIVE,
+        "active_low": False,
+    }
+    assert config[25].kwargs["active_low"] is True
+    assert gpiod.requests[0].writes == [{27: FakeValue.ACTIVE, 23: FakeValue.ACTIVE, 25: FakeValue.INACTIVE}]
+
+
+def test_gpiod_outputs_close_drives_safe_state() -> None:
+    gpiod = fake_gpiod(FakeValue.INACTIVE)
+    outputs = hw.GpiodOutputs(gpiod_module=gpiod)
+    outputs.write({"fan": True, "buzzer": True, "led_red": True, "relay": True})
+    outputs.write({"buzzer": False})
+    assert len(gpiod.calls) == 1, "lines should stay requested between writes"
+    request = gpiod.requests[0]
+    assert request.levels()[25] == FakeValue.ACTIVE
+    outputs.close()
+    assert request.writes[-1] == ALL_INACTIVE
+    assert request.released
+    outputs.close()
+
+
+def test_gpiod_outputs_failed_write_goes_safe_and_retries() -> None:
+    gpiod = fake_gpiod(FakeValue.INACTIVE)
+    outputs = hw.GpiodOutputs(gpiod_module=gpiod)
+    outputs.write({"relay": True, "fan": True})
+    first = gpiod.requests[0]
+    first.failing_writes = 1
+    error = raises(hw.ActuatorError, outputs.write, {"relay": True})
+    assert "/dev/gpiochip0" in str(error)
+    assert first.levels() == ALL_INACTIVE, "safe state should be attempted after a failed write"
+    assert first.released
+    outputs.write({"fan": True})
+    assert len(gpiod.calls) == 2, "the lines should be requested again"
+
+
+def test_gpiod_outputs_missing_chip_is_an_actuator_error() -> None:
+    gpiod = fake_gpiod(FakeValue.INACTIVE)
+
+    def missing_chip(*args: Any, **kwargs: Any) -> None:
+        raise FileNotFoundError(2, "No such file or directory", "/dev/gpiochip0")
+
+    gpiod.request_lines = missing_chip
+    outputs = hw.GpiodOutputs(gpiod_module=gpiod)
+    raises(hw.ActuatorError, outputs.write, {"fan": True})
+    outputs.close()
+
+
+def test_gpiod_outputs_reject_bad_config() -> None:
+    raises(ValueError, hw.GpiodOutputs, "/dev/gpiochip0", {"fan": 27, "siren": 5})
+    raises(ValueError, hw.GpiodOutputs, "/dev/gpiochip0", {"fan": 27, "relay": 27})
+    raises(ValueError, hw.GpiodOutputs, "/dev/gpiochip0", {"fan": 27}, ["relay"])
+    outputs = hw.GpiodOutputs(gpiod_module=fake_gpiod(FakeValue.INACTIVE))
+    raises(ValueError, outputs.write, {"fan": True, "siren": True})
+
+
+def test_gpio_outputs_builder_overrides_and_skips_lines() -> None:
+    hardware = {"actuators": {"lines": {"fan": 26, "relay": None}, "active_low": ["led_red"]}}
+    outputs = hw.build_gpio_outputs(hardware)
+    assert isinstance(outputs, hw.GpiodOutputs)
+    gpiod = fake_gpiod(FakeValue.INACTIVE)
+    outputs._gpiod = gpiod
+    outputs.write({"fan": True, "relay": True})
+    config = gpiod.calls[0]["config"]
+    assert sorted(config) == [18, 22, 23, 24, 26]
+    assert config[24].kwargs["active_low"] is True
+    assert gpiod.requests[0].writes == [{26: FakeValue.ACTIVE}]
 
 
 def test_builders_follow_config() -> None:

@@ -47,6 +47,18 @@
       "gpio_line": 17,
       "bias": "pull-up",
       "open_level": "high"
+    },
+    "actuators": {
+      "gpio_chip": "/dev/gpiochip0",
+      "lines": {
+        "fan": 27,
+        "buzzer": 18,
+        "led_green": 22,
+        "led_blue": 23,
+        "led_red": 24,
+        "relay": 25
+      },
+      "active_low": []
     }
   }
 }

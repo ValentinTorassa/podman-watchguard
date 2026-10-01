@@ -1,7 +1,7 @@
-"""Raspberry Pi sensor drivers for Podman Watchguard.
+"""Raspberry Pi sensor and actuator drivers for Podman Watchguard.
 
-Every sensor is read through a standard Linux interface, following the wiring
-in docs/proyecto.md:
+Every device is driven through a standard Linux interface, following the
+wiring in docs/proyecto.md:
 
 - DHT22 (GPIO4): kernel ``dht11`` IIO driver, which also handles the DHT22.
   Enabled with ``dtoverlay=dht11,gpiopin=4`` and read from
@@ -10,6 +10,8 @@ in docs/proyecto.md:
   ``/sys/class/hwmon`` or raw register reads over ``/dev/i2c-1`` with smbus2.
 - Reed switch (GPIO17 to GND, internal pull-up): GPIO character device
   through libgpiod v2 (the ``gpiod`` Python bindings).
+- Fan (GPIO27), buzzer (GPIO18), LED green/blue/red (GPIO22/23/24) and relay
+  (GPIO25): outputs on the same GPIO character device, also with libgpiod v2.
 
 smbus2 and gpiod are imported lazily, so simulation mode and the unit tests
 only need the standard library. Each driver takes its I/O dependency as a
@@ -18,14 +20,19 @@ constructor argument, which is how the tests substitute fakes.
 
 from __future__ import annotations
 
+import contextlib
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 from typing import Any, ClassVar, Protocol
 
 
 class SensorError(RuntimeError):
     """A hardware sensor could not be read or returned an implausible value."""
+
+
+class ActuatorError(RuntimeError):
+    """An actuator output could not be driven."""
 
 
 class ClimateSensor(Protocol):
@@ -41,6 +48,14 @@ class PowerSensor(Protocol):
 class TamperSensor(Protocol):
     def read(self) -> bool:
         """Return True when the enclosure is open."""
+
+
+class Outputs(Protocol):
+    def write(self, levels: Mapping[str, bool]) -> None:
+        """Drive the named outputs; True energizes one (fan running, relay cutting power)."""
+
+    def close(self) -> None:
+        """De-energize every output and release it."""
 
 
 def _read_int(path: Path) -> int:
@@ -288,6 +303,107 @@ class GpiodTamperSwitch:
         )
 
 
+OUTPUT_NAMES = ("fan", "buzzer", "led_green", "led_blue", "led_red", "relay")
+
+# GPIO offsets on gpiochip0 from the wiring table in docs/proyecto.md.
+DEFAULT_OUTPUT_LINES: dict[str, int] = {
+    "fan": 27,
+    "buzzer": 18,
+    "led_green": 22,
+    "led_blue": 23,
+    "led_red": 24,
+    "relay": 25,
+}
+
+
+class GpiodOutputs:
+    """Fan, buzzer, LED and relay driven as GPIO outputs with libgpiod v2.
+
+    Every actuator is a plain on/off line: the fan and buzzer through their
+    transistor or MOSFET stage, one line per LED colour, and the relay module's
+    input. ``write()`` takes the names in OUTPUT_NAMES; an output with no line
+    configured is left alone. Outputs listed in ``active_low`` are energized by
+    a low level (relay modules that trigger on low, a common-anode RGB LED);
+    the kernel inverts those lines, so callers always think in on/off.
+
+    The safe state is every output inactive: fan and buzzer off, LED dark and
+    the relay released, which, with the router on the relay's normally closed
+    contact, keeps the router powered. The lines are requested with that level
+    as their initial value, so (re)starting the monitor never energizes
+    anything before the first decision. ``close()`` drives the safe state
+    before releasing the lines, and a failed write drives it as far as the
+    chip allows, releases the lines and raises ActuatorError; the next write
+    requests them again.
+    """
+
+    def __init__(
+        self,
+        chip: str = "/dev/gpiochip0",
+        lines: Mapping[str, int] | None = None,
+        active_low: Iterable[str] = (),
+        gpiod_module: Any = None,
+    ) -> None:
+        self._lines = dict(DEFAULT_OUTPUT_LINES if lines is None else lines)
+        unknown = sorted(set(self._lines) - set(OUTPUT_NAMES))
+        if unknown:
+            raise ValueError(f"unknown outputs {unknown} (known: {', '.join(OUTPUT_NAMES)})")
+        if len(set(self._lines.values())) != len(self._lines):
+            raise ValueError("each output needs a GPIO line of its own")
+        self._active_low = set(active_low)
+        unwired = sorted(self._active_low - set(self._lines))
+        if unwired:
+            raise ValueError(f"active_low lists outputs without a line: {unwired}")
+        self._chip = chip
+        self._gpiod = gpiod_module
+        self._request: Any = None
+
+    def write(self, levels: Mapping[str, bool]) -> None:
+        unknown = sorted(set(levels) - set(OUTPUT_NAMES))
+        if unknown:
+            raise ValueError(f"unknown outputs {unknown}")
+        try:
+            if self._request is None:
+                self._request = self._request_lines()
+            value = self._gpiod.line.Value
+            values = {
+                self._lines[name]: value.ACTIVE if on else value.INACTIVE
+                for name, on in levels.items()
+                if name in self._lines
+            }
+            if values:
+                self._request.set_values(values)
+        except OSError as exc:
+            with contextlib.suppress(OSError):
+                self.close()
+            raise ActuatorError(f"GPIO output on {self._chip} failed: {exc}") from exc
+
+    def close(self) -> None:
+        if self._request is None:
+            return
+        request, self._request = self._request, None
+        try:
+            inactive = self._gpiod.line.Value.INACTIVE
+            request.set_values({line: inactive for line in self._lines.values()})
+        finally:
+            request.release()
+
+    def _request_lines(self) -> Any:
+        if self._gpiod is None:
+            import gpiod  # optional dependency (libgpiod v2 bindings), only needed on the Pi
+
+            self._gpiod = gpiod
+        line = self._gpiod.line
+        config = {
+            offset: self._gpiod.LineSettings(
+                direction=line.Direction.OUTPUT,
+                output_value=line.Value.INACTIVE,
+                active_low=name in self._active_low,
+            )
+            for name, offset in self._lines.items()
+        }
+        return self._gpiod.request_lines(self._chip, consumer="watchguard-monitor", config=config)
+
+
 def _parse_address(value: Any) -> int:
     return int(value, 0) if isinstance(value, str) else int(value)
 
@@ -331,4 +447,20 @@ def build_tamper_sensor(hardware: dict[str, Any]) -> TamperSensor:
         line=int(options.get("gpio_line", 17)),
         bias=options.get("bias", "pull-up"),
         open_level=options.get("open_level", "high"),
+    )
+
+
+def build_gpio_outputs(hardware: dict[str, Any]) -> Outputs:
+    """Build the actuator outputs from the ``actuators`` config section.
+
+    ``lines`` overrides the documented wiring output by output; ``null`` leaves
+    an output undriven, for example when no relay module is fitted.
+    """
+    options = hardware.get("actuators", {})
+    lines: dict[str, Any] = dict(DEFAULT_OUTPUT_LINES)
+    lines.update(options.get("lines", {}))
+    return GpiodOutputs(
+        chip=options.get("gpio_chip", "/dev/gpiochip0"),
+        lines={name: int(line) for name, line in lines.items() if line is not None},
+        active_low=options.get("active_low", []),
     )
