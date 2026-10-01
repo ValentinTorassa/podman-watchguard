@@ -16,6 +16,7 @@ import json
 import random
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -47,6 +48,8 @@ class ActuatorState:
     buzzer_on: bool
     led_state: str
     relay_reset_requested: bool
+    relay_on: bool
+    relay_phase: str
 
 
 class SensorBackend:
@@ -117,6 +120,74 @@ class RaspberryPiBackend(SensorBackend):
                 close()
 
 
+class RelaySequencer:
+    """Power-cycles the router through the relay, behind a safety delay.
+
+    The relay cuts the router's power only after the anomalous power condition
+    (low voltage and high current at once) has been present on every reading
+    for ``trigger_delay_seconds``. It then holds the power off for
+    ``power_off_seconds`` whatever the readings say (the current drops as soon
+    as the load is off) and, once power is back, ignores the condition for
+    ``cooldown_seconds`` so the router can boot before it is judged again. A
+    reading without the condition while armed starts the delay over.
+
+    Phases: ``idle`` -> ``armed`` -> ``power_cut`` -> ``cooldown`` -> ``idle``.
+    The relay is energized only in ``power_cut``. Times come from a monotonic
+    clock, so they are at least the configured values, rounded up to the next
+    reading.
+    """
+
+    IDLE = "idle"
+    ARMED = "armed"
+    POWER_CUT = "power_cut"
+    COOLDOWN = "cooldown"
+
+    def __init__(
+        self,
+        trigger_delay_seconds: float = 30.0,
+        power_off_seconds: float = 10.0,
+        cooldown_seconds: float = 300.0,
+    ) -> None:
+        if trigger_delay_seconds <= 0:
+            raise ValueError("relay trigger_delay_seconds must be positive")
+        if power_off_seconds <= 0:
+            raise ValueError("relay power_off_seconds must be positive")
+        if cooldown_seconds < 0:
+            raise ValueError("relay cooldown_seconds cannot be negative")
+        self._trigger_delay = trigger_delay_seconds
+        self._power_off = power_off_seconds
+        self._cooldown = cooldown_seconds
+        self.phase = self.IDLE
+        self._since = 0.0
+
+    def update(self, reset_requested: bool, now: float) -> str:
+        if self.phase == self.POWER_CUT and now - self._since >= self._power_off:
+            self._enter(self.COOLDOWN, now)
+        if self.phase == self.COOLDOWN and now - self._since >= self._cooldown:
+            self._enter(self.IDLE, now)
+        if self.phase == self.IDLE:
+            if reset_requested:
+                self._enter(self.ARMED, now)
+        elif self.phase == self.ARMED:
+            if not reset_requested:
+                self._enter(self.IDLE, now)
+            elif now - self._since >= self._trigger_delay:
+                self._enter(self.POWER_CUT, now)
+        return self.phase
+
+    def abort(self, now: float) -> str:
+        """Release the relay at once; a cut in progress still earns its cooldown."""
+        if self.phase == self.POWER_CUT:
+            self._enter(self.COOLDOWN, now)
+        elif self.phase == self.ARMED:
+            self._enter(self.IDLE, now)
+        return self.phase
+
+    def _enter(self, phase: str, now: float) -> None:
+        self.phase = phase
+        self._since = now
+
+
 class Controller:
     """Decides the actuator states from one reading.
 
@@ -125,10 +196,10 @@ class Controller:
     off once the temperature is back at ``fan_off_celsius`` and the humidity at
     ``fan_off_percent`` (5 points below the warning if not configured), so it
     does not flap around either threshold. The alerts (buzzer, red LED) use
-    the plain thresholds.
+    the plain thresholds. The relay reset goes through RelaySequencer.
     """
 
-    def __init__(self, config: dict[str, Any]) -> None:
+    def __init__(self, config: dict[str, Any], clock: Callable[[], float] = time.monotonic) -> None:
         control = config["temperature_control"]
         humidity = config["humidity"]
         power = config["power"]
@@ -143,6 +214,13 @@ class Controller:
             raise ValueError("need fan_off_celsius < fan_on_celsius <= critical_celsius")
         if not self._humidity_fan_off < self._humidity_warning:
             raise ValueError("need humidity fan_off_percent < warning_percent")
+        relay = config.get("relay", {})
+        self._relay = RelaySequencer(
+            trigger_delay_seconds=float(relay.get("trigger_delay_seconds", 30.0)),
+            power_off_seconds=float(relay.get("power_off_seconds", 10.0)),
+            cooldown_seconds=float(relay.get("cooldown_seconds", 300.0)),
+        )
+        self._clock = clock
         self._thermal_fan = False
         self._humidity_fan = False
 
@@ -165,12 +243,16 @@ class Controller:
         low_voltage = reading.voltage <= self._low_voltage
         high_current = reading.current_ma >= self._high_current_ma
         alert = critical or humid or low_voltage or high_current or reading.tamper_open
+        reset_requested = low_voltage and high_current
+        relay_phase = self._relay.update(reset_requested, self._clock())
 
         return ActuatorState(
             fan_on=fan,
             buzzer_on=alert,
             led_state="red" if alert else ("blue" if fan else "green"),
-            relay_reset_requested=low_voltage and high_current,
+            relay_reset_requested=reset_requested,
+            relay_on=relay_phase == RelaySequencer.POWER_CUT,
+            relay_phase=relay_phase,
         )
 
 

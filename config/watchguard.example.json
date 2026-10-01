@@ -14,6 +14,11 @@
     "low_voltage": 4.75,
     "high_current_ma": 950
   },
+  "relay": {
+    "trigger_delay_seconds": 30,
+    "power_off_seconds": 10,
+    "cooldown_seconds": 300
+  },
   "simulation": {
     "enabled": true,
     "temperature_celsius": 36.5,

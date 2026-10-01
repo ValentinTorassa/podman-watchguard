@@ -26,6 +26,14 @@ CALM = monitor.SensorReading(
 )
 
 
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
 def example_config() -> dict[str, Any]:
     with (ROOT / "config/watchguard.example.json").open(encoding="utf-8") as fh:
         return json.load(fh)
@@ -46,7 +54,12 @@ def raises(exc_type: type[BaseException], func: Any, *args: Any) -> BaseExceptio
 def test_calm_cabinet_is_green() -> None:
     state = monitor.Controller(example_config()).decide(CALM)
     assert state == monitor.ActuatorState(
-        fan_on=False, buzzer_on=False, led_state="green", relay_reset_requested=False
+        fan_on=False,
+        buzzer_on=False,
+        led_state="green",
+        relay_reset_requested=False,
+        relay_on=False,
+        relay_phase="idle",
     )
 
 
@@ -104,6 +117,84 @@ def test_power_alerts_and_reset_request() -> None:
     assert (high.buzzer_on, high.relay_reset_requested) == (True, False)
     both = controller.decide(reading(voltage=4.7, current_ma=1000.0))
     assert (both.buzzer_on, both.relay_reset_requested) == (True, True)
+
+
+POWER_FAULT = {"voltage": 4.7, "current_ma": 1000.0}
+
+
+def relay_run(controller: monitor.Controller, clock: FakeClock, steps: list[tuple[float, bool]]) -> list[str]:
+    """Feed (time offset, power fault?) readings and collect the relay phases."""
+    start = clock.now
+    phases = []
+    for offset, fault in steps:
+        clock.now = start + offset
+        state = controller.decide(reading(**POWER_FAULT) if fault else CALM)
+        assert state.relay_on == (state.relay_phase == "power_cut")
+        phases.append(state.relay_phase)
+    return phases
+
+
+def test_relay_waits_for_the_safety_delay() -> None:
+    clock = FakeClock()
+    controller = monitor.Controller(example_config(), clock=clock)
+    phases = relay_run(
+        controller,
+        clock,
+        [
+            (0, True),  # fault seen: armed, relay still released
+            (28, True),
+            (30, True),  # held for trigger_delay_seconds: power cut
+            (32, False),  # router off, current drops: the cut is not cut short
+            (39, False),
+            (40, False),  # power_off_seconds later: power restored
+            (100, True),  # router booting: ignored during the cooldown
+            (339, True),
+            (340, True),  # cooldown over: armed again, not cut straight away
+            (369, True),
+            (370, True),
+        ],
+    )
+    assert phases == [
+        "armed",
+        "armed",
+        "power_cut",
+        "power_cut",
+        "power_cut",
+        "cooldown",
+        "cooldown",
+        "cooldown",
+        "armed",
+        "armed",
+        "power_cut",
+    ]
+
+
+def test_relay_needs_the_fault_on_every_reading() -> None:
+    clock = FakeClock()
+    controller = monitor.Controller(example_config(), clock=clock)
+    phases = relay_run(controller, clock, [(0, True), (20, False), (22, True), (50, True), (52, True)])
+    assert phases == ["armed", "idle", "armed", "armed", "power_cut"]
+
+
+def test_relay_ignores_a_single_power_alert() -> None:
+    clock = FakeClock()
+    controller = monitor.Controller(example_config(), clock=clock)
+    for offset in (0, 60, 120):
+        clock.now += offset
+        state = controller.decide(reading(voltage=4.7))
+        assert (state.buzzer_on, state.relay_phase) == (True, "idle")
+
+
+def test_relay_timing_comes_from_config() -> None:
+    config = example_config()
+    config["relay"] = {"trigger_delay_seconds": 4, "power_off_seconds": 2, "cooldown_seconds": 0}
+    clock = FakeClock()
+    controller = monitor.Controller(config, clock=clock)
+    phases = relay_run(controller, clock, [(0, True), (4, True), (6, True), (8, True), (12, True)])
+    assert phases == ["armed", "power_cut", "armed", "armed", "power_cut"]
+    for bad in ({"trigger_delay_seconds": 0}, {"power_off_seconds": 0}, {"cooldown_seconds": -1}):
+        config["relay"] = bad
+        raises(ValueError, monitor.Controller, config)
 
 
 def test_controller_rejects_inverted_thresholds() -> None:
