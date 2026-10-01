@@ -15,8 +15,8 @@ What the repository contains today, and what it does not:
 | Piece | State |
 |---|---|
 | Monitor control logic and JSON telemetry | Works; runs in simulation mode on any machine |
-| Monitor sensor reads on the Pi (DHT22, INA219, reed switch) | Implemented on standard Linux interfaces and unit-tested with fakes; **not yet run on real hardware** |
-| Monitor driving the fan, LED, buzzer and relay | **Not implemented**: actuator states are decided and reported, no GPIO output is written |
+| Monitor sensor reads on the Pi (DHT22, INA219 voltage, current and power, reed switch) | Implemented on standard Linux interfaces and unit-tested with fakes; **not yet run on real hardware** |
+| Monitor driving the fan, LED, buzzer and relay | Implemented as on/off GPIO outputs with libgpiod v2, with a safety delay on the relay and a safe state on errors and shutdown; unit-tested with fakes; **not yet run on real hardware** |
 | Quadlets: pod, monitor, WireGuard, Cowrie, step-ca | Written and checked with `quadlet -dryrun` (Podman 5.4.2); **not yet deployed on a Pi** |
 | Image updates | `podman auto-update` through the quadlets' `AutoUpdate=` keys |
 | GitOps agent that pulls this repo and applies quadlet changes | **Does not exist**; quadlet changes are copied to the Pi by hand |
@@ -24,7 +24,7 @@ What the repository contains today, and what it does not:
 
 ## Overview
 
-The monitor reads environmental and tamper sensors, decides actuator states and emits JSON telemetry. The network services run as rootless Podman containers, described by quadlet units in `quadlets/` and kept up to date by `podman auto-update`.
+The monitor reads environmental, power and tamper sensors, drives the fan, LED, buzzer and relay, and emits JSON telemetry. The network services run as rootless Podman containers, described by quadlet units in `quadlets/` and kept up to date by `podman auto-update`.
 
 ```
 Git repo (this repo) --- quadlets copied by hand ---> ~/.config/containers/systemd/
@@ -34,6 +34,7 @@ Git repo (this repo) --- quadlets copied by hand ---> ~/.config/containers/syste
 |                                                                |
 |  watchguard-monitor (standalone container, no published ports) |
 |    DHT22 via sysfs IIO, INA219 via I2C, reed switch via GPIO   |
+|    fan, buzzer, RGB LED and relay via GPIO outputs             |
 |    -> JSON telemetry on stdout (journald)                      |
 |                                                                |
 |  watchguard pod (one shared network namespace, pasta)          |
@@ -50,7 +51,7 @@ Git repo (this repo) --- quadlets copied by hand ---> ~/.config/containers/syste
 
 ### IoT Monitor
 
-`gitops-agent/watchguard_monitor.py` holds the control logic (fan hysteresis, alert conditions) and the simulation backend; `gitops-agent/watchguard_hardware.py` holds the Raspberry Pi drivers. The Pi backend reads each sensor through a standard Linux interface, using the wiring in `docs/proyecto.md`:
+`gitops-agent/watchguard_monitor.py` holds the control logic (fan hysteresis, alert conditions, relay sequencing) and the simulation backend; `gitops-agent/watchguard_hardware.py` holds the Raspberry Pi drivers. The Pi backend reads each sensor through a standard Linux interface, using the wiring in `docs/proyecto.md`:
 
 | Sensor | Wiring | Interface | Host setup |
 |---|---|---|---|
@@ -60,9 +61,32 @@ Git repo (this repo) --- quadlets copied by hand ---> ~/.config/containers/syste
 
 The `hardware` section of `config/watchguard.example.json` configures all of this: the IIO device name and DHT22 retry count, the INA219 driver, bus, address and shunt resistance (0.1 ohm on common breakouts; with `hwmon`, the current is rescaled from the driver's `shunt_resistor` to this value), and the GPIO chip, line, bias and open level of the reed switch. Set `"simulation": {"enabled": false}` to use it. `gpiod` and `smbus2` are imported only in hardware mode and are installed in the container image (`gitops-agent/requirements.txt`).
 
-A failed read emits `{"device_id", "timestamp", "error"}` instead of a reading, and the monitor tries again on the next cycle instead of exiting. DHT22 timing errors, which are common, are retried within the cycle first. A limitation: one failing sensor blanks the whole reading for that cycle, including the tamper state.
+The actuators are outputs on the same GPIO chip, also driven with libgpiod v2, with the wiring in `docs/proyecto.md`:
 
-Actuator decisions (fan, LED colour, buzzer, relay reset) are included in every event, but the monitor does not drive those GPIO outputs yet.
+| Actuator | Wiring | Driven as |
+|---|---|---|
+| Fan | GPIO27 | On/off through the MOSFET |
+| Buzzer | GPIO18 | On/off through the transistor. There is no PWM tone, so it needs an active buzzer (one with its own oscillator); a passive piezo only clicks |
+| LED | GPIO22 green, GPIO23 blue, GPIO24 red | One line per colour, one colour lit at a time |
+| Relay | GPIO25 | The module's input; energized only while it cuts the router's power |
+
+`hardware.actuators` sets the chip and the lines (`null` leaves an output undriven, for example when no relay is fitted) and `active_low` lists the outputs that a low level energizes, such as relay modules that trigger on low or a common-anode RGB LED.
+
+On each reading the controller decides, with the thresholds in `temperature_control`, `humidity`, `power` and `relay`:
+
+- **Fan**: on at 34 °C or at 75 % relative humidity; off only once the temperature is back at 30 °C and the humidity at 70 % (`fan_off_percent`), so it does not flap around either threshold. The LED is blue while it runs.
+- **Alerts**: critical temperature (42 °C), humidity at the warning (75 %), low voltage (4.75 V or less), high current (950 mA or more) or an open enclosure. Any of them sounds the buzzer and turns the LED red, and the event names them under `alerts`. With no alert and the fan off, the LED is green.
+- **Relay**: a reset is requested when low voltage and high current coincide. The relay cuts the power only after that has held on every reading for 30 s (`trigger_delay_seconds`), keeps it off for 10 s (`power_off_seconds`) whatever the readings say, and then ignores the condition for 300 s (`cooldown_seconds`) so the router can boot. The report asks for a safety delay without giving values; these defaults are this repository's choice. The event shows `relay_phase`: `idle`, `armed`, `power_cut` or `cooldown`. Wire the router through the relay's normally closed contact, so that a released relay means a powered router.
+
+Each event carries `reading` (temperature, humidity, bus voltage, current, `power_mw` and the tamper state), `alerts` and `actuators`. `power_mw` is bus voltage times current, the product the INA219's power register would hold; it is computed because the `smbus` driver leaves the chip's calibration unset.
+
+Errors and the safe state, which is every output off (relay released, so the router is powered):
+
+- The lines are requested with every output off, so a monitor that starts or restarts energizes nothing before its first decision.
+- On exit (end of `--iterations`, SIGTERM from `podman stop` or `systemctl stop`, or an unexpected exception) every output is switched off before the lines are released.
+- A failed read emits `error` instead of `reading`, with `"alerts": ["sensor_error"]`, and the monitor tries again on the next cycle instead of exiting. Meanwhile the relay is released and any pending or running reset is abandoned, the fan is latched on until a valid reading is back at the fan-off thresholds, the LED is red and the buzzer stays quiet. DHT22 timing errors, which are common, are retried within the cycle first. A limitation: one failing sensor blanks the whole reading for that cycle, including the tamper state.
+- A failed GPIO write switches off what it still can, releases the lines and abandons any relay sequence; the event carries `actuator_error` instead of `actuators`, and the next cycle requests the lines again.
+- Not covered: SIGKILL, an OOM kill or a kernel crash. The lines are then released without being switched off and may keep their last level until `Restart=always` brings the monitor back, about 10 s later, and it requests them switched off.
 
 ### Updates: what is GitOps today
 
@@ -137,7 +161,7 @@ The monitor quadlet passes `/dev/gpiochip0` and `/dev/i2c-1` only if they exist 
 | Storage | microSD, 16 GB+ recommended |
 | Network | Built-in WiFi plus USB Ethernet adapter recommended |
 | Sensors | DHT22, INA219, magnetic reed switch |
-| Actuators | 5 V fan, piezo buzzer, LED, optional relay module |
+| Actuators | 5 V fan, active piezo buzzer, RGB LED, optional relay module |
 
 ## Requirements
 
@@ -157,13 +181,13 @@ podman-watchguard/
 ├── gitops-agent/        # Monitor application code (no GitOps agent yet)
 ├── quadlets/            # Podman quadlet units: pod, monitor, WireGuard, Cowrie, step-ca
 ├── scripts/             # Setup, test and utility scripts
-├── tests/               # Repository checks and hardware-backend unit tests
+├── tests/               # Repository checks, hardware-backend and control-logic tests
 └── docs/                # Academic report in Markdown and PDF
 ```
 
 ## Local Validation
 
-Run the repository checks and the hardware-backend tests (fake sysfs trees, a fake I2C bus and a fake gpiod module; no Pi needed):
+Run the repository checks, the hardware-backend tests (fake sysfs trees, a fake I2C bus and a fake gpiod module; no Pi needed) and the control-logic tests (thresholds, hysteresis, relay timing, fault and shutdown handling):
 
 ```sh
 make test
