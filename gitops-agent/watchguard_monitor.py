@@ -37,6 +37,7 @@ class SensorReading:
     humidity_percent: float
     voltage: float
     current_ma: float
+    power_mw: float
     tamper_open: bool
 
 
@@ -63,13 +64,14 @@ class SimulationBackend(SensorBackend):
     def read(self) -> SensorReading:
         temp = float(self._base.get("temperature_celsius", 32.0))
         humidity = float(self._base.get("humidity_percent", 55.0))
-        voltage = float(self._base.get("voltage", 5.0))
-        current = float(self._base.get("current_ma", 350.0))
+        voltage = float(self._base.get("voltage", 5.0)) + random.uniform(-0.03, 0.03)
+        current = float(self._base.get("current_ma", 350.0)) + random.uniform(-15, 15)
         return SensorReading(
             temperature_celsius=round(temp + random.uniform(-0.4, 0.4), 2),
             humidity_percent=round(humidity + random.uniform(-1.0, 1.0), 2),
-            voltage=round(voltage + random.uniform(-0.03, 0.03), 3),
-            current_ma=round(current + random.uniform(-15, 15), 1),
+            voltage=round(voltage, 3),
+            current_ma=round(current, 1),
+            power_mw=round(voltage * current, 1),
             tamper_open=bool(self._base.get("tamper_open", False)),
         )
 
@@ -101,6 +103,10 @@ class RaspberryPiBackend(SensorBackend):
             humidity_percent=round(humidity, 2),
             voltage=round(voltage, 3),
             current_ma=round(current_ma, 1),
+            # Power delivered to the load: bus voltage (VIN-) times current,
+            # the same product the INA219's power register holds. Computed here
+            # because the smbus driver leaves the calibration register unset.
+            power_mw=round(voltage * current_ma, 1),
             tamper_open=self._tamper.read(),
         )
 

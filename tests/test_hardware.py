@@ -263,6 +263,7 @@ def test_raspberry_pi_backend_composes_reading() -> None:
         humidity_percent=45.68,
         voltage=5.012,
         current_ma=420.0,
+        power_mw=2105.4,
         tamper_open=True,
     )
 
@@ -305,6 +306,7 @@ def test_monitor_reads_hardware_end_to_end() -> None:
         "humidity_percent": 50.0,
         "voltage": 5.05,
         "current_ma": 410.0,
+        "power_mw": 2070.5,
         "tamper_open": True,
     }
     assert event["actuators"]["fan_on"] is True
