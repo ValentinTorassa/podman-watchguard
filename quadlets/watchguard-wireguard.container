@@ -1,0 +1,30 @@
+[Unit]
+Description=Podman Watchguard WireGuard gateway
+
+[Container]
+# The tag follows wireguard-tools 1.0.20260223; linuxserver.io re-pushes it
+# with base-image fixes, which podman auto-update pulls.
+Image=lscr.io/linuxserver/wireguard:1.0.20260223
+ContainerName=watchguard-wireguard
+Pod=watchguard.pod
+AutoUpdate=registry
+# Creates wg0 and its NAT rules inside the pod's network namespace. The
+# wireguard kernel module must already be loaded on the host.
+AddCapability=NET_ADMIN
+# SERVERURL, PEERS, ...: copy config/wireguard.env.example. Not committed.
+EnvironmentFile=%h/.config/podman-watchguard/wireguard.env
+# Never print peer configs, which contain private keys, to the journal.
+Environment=LOG_CONFS=false
+# Server and peer keys are generated here on first start.
+Volume=watchguard-wireguard:/config
+HealthCmd=wg show wg0 listen-port
+HealthInterval=5m
+HealthRetries=2
+HealthOnFailure=kill
+
+[Service]
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

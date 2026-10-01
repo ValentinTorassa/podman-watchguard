@@ -23,11 +23,15 @@ def test_required_files() -> None:
         "docs/proyecto.pdf",
         "docs/test-report.md",
         "config/watchguard.example.json",
+        "config/wireguard.env.example",
         "containers/monitor/Containerfile",
         "gitops-agent/watchguard_monitor.py",
         "gitops-agent/watchguard_hardware.py",
         "gitops-agent/requirements.txt",
         "quadlets/watchguard-monitor.container",
+        "quadlets/watchguard-wireguard.container",
+        "quadlets/watchguard-cowrie.container",
+        "quadlets/watchguard-step-ca.container",
         "quadlets/watchguard.pod",
         "scripts/install-podman-macos.sh",
         "scripts/podman-smoke-test.sh",
@@ -43,13 +47,38 @@ def test_config_is_valid_json() -> None:
     assert config["simulation"]["enabled"] is True
 
 
+def quadlet_files() -> list[Path]:
+    return sorted((ROOT / "quadlets").glob("*.container")) + sorted((ROOT / "quadlets").glob("*.pod"))
+
+
+def read_quadlet(path: Path) -> configparser.ConfigParser:
+    parser = configparser.ConfigParser(strict=False, interpolation=None)
+    parser.optionxform = str
+    read = parser.read(path)
+    assert read, f"could not parse {path}"
+    return parser
+
+
 def test_quadlets_parse_as_ini() -> None:
-    for path in ["quadlets/watchguard-monitor.container", "quadlets/watchguard.pod"]:
-        parser = configparser.ConfigParser(strict=False)
-        parser.optionxform = str
-        read = parser.read(ROOT / path)
-        assert read, f"could not parse {path}"
-        assert "Unit" in parser.sections(), f"{path} missing Unit section"
+    for path in quadlet_files():
+        parser = read_quadlet(path)
+        assert "Unit" in parser.sections(), f"{path.name} missing Unit section"
+
+
+def test_quadlets_support_auto_update() -> None:
+    for path in sorted((ROOT / "quadlets").glob("*.container")):
+        container = read_quadlet(path)["Container"]
+        pod = container.get("Pod")
+        if pod:
+            assert (ROOT / "quadlets" / pod).exists(), f"{path.name} joins missing {pod}"
+        policy = container.get("AutoUpdate")
+        assert policy in ("registry", "local"), f"{path.name} has no AutoUpdate policy"
+        if policy == "registry":
+            image = container["Image"]
+            registry, _, rest = image.partition("/")
+            assert "." in registry, f"{path.name}: auto-update needs a fully qualified image, got {image}"
+            tag = rest.rpartition(":")[2] if ":" in rest else ""
+            assert tag and tag != "latest", f"{path.name}: pin a tag instead of {image}"
 
 
 def test_document_answers_assignment() -> None:
@@ -94,6 +123,7 @@ def main() -> int:
         test_required_files,
         test_config_is_valid_json,
         test_quadlets_parse_as_ini,
+        test_quadlets_support_auto_update,
         test_document_answers_assignment,
         test_monitor_outputs_json,
     ]

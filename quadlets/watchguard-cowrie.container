@@ -1,0 +1,28 @@
+[Unit]
+Description=Podman Watchguard Cowrie SSH honeypot
+
+[Container]
+# The tag follows Cowrie 3.0.x patch releases.
+Image=docker.io/cowrie/cowrie:3.0
+ContainerName=watchguard-cowrie
+Pod=watchguard.pod
+AutoUpdate=registry
+# Cowrie runs as uid 999 and listens on 2222, so it needs no capabilities.
+DropCapability=ALL
+NoNewPrivileges=true
+# Logs, TTY recordings and captured downloads (live malware samples).
+Volume=watchguard-cowrie:/cowrie/cowrie-git/var
+# The image has no shell. The check looks for the listening socket on 2222
+# (0x08AE) in /proc/net instead of connecting, so it never appears as an
+# attacker session in the honeypot logs.
+HealthCmd=["/cowrie/cowrie-env/bin/python3", "-c", "import sys; sys.exit(0 if any(r.split()[1].endswith(':08AE') and r.split()[3] == '0A' for t in ('tcp', 'tcp6') for r in open('/proc/net/' + t).readlines()[1:]) else 1)"]
+HealthInterval=5m
+HealthRetries=2
+HealthOnFailure=kill
+
+[Service]
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

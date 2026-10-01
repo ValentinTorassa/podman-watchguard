@@ -3,7 +3,14 @@ Description=Podman Watchguard service pod
 
 [Pod]
 PodName=watchguard
+# pasta names the pod interface after the host uplink (wlan0 on a Zero 2 W).
+# Pin it to eth0 so the WireGuard image's NAT rule (-o eth+) matches.
+Network=pasta:-I,eth0
+# WireGuard peers are routed out of the pod's network namespace.
+PodmanArgs=--sysctl=net.ipv4.ip_forward=1
+# WireGuard
 PublishPort=51820:51820/udp
+# Cowrie SSH honeypot
 PublishPort=2222:2222/tcp
 
 [Install]

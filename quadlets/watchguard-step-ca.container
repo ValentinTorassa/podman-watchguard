@@ -1,0 +1,29 @@
+[Unit]
+Description=Podman Watchguard step-ca certificate authority
+
+[Container]
+# smallstep publishes no minor-version tag, so auto-update only picks up a
+# rebuilt 0.30.2. Moving to a newer release is a reviewed change to this file.
+Image=docker.io/smallstep/step-ca:0.30.2
+ContainerName=watchguard-step-ca
+Pod=watchguard.pod
+AutoUpdate=registry
+# step-ca runs as uid 1000 and listens on 9000, so it needs no capabilities.
+DropCapability=ALL
+NoNewPrivileges=true
+# CA keys, certificates and database. Initialise it once first (see README).
+Volume=watchguard-step-ca:/home/step
+# Decrypts the CA keys. Created with `podman secret create`, never committed.
+Secret=watchguard-step-ca-password,type=mount,uid=1000,gid=1000,mode=0400
+Exec=/usr/local/bin/step-ca --password-file /run/secrets/watchguard-step-ca-password /home/step/config/ca.json
+HealthCmd=step ca health --ca-url https://localhost:9000 --root /home/step/certs/root_ca.crt | grep -q ^ok
+HealthInterval=5m
+HealthRetries=2
+HealthOnFailure=kill
+
+[Service]
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
