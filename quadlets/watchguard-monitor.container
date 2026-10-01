@@ -9,6 +9,13 @@ ContainerName=watchguard-monitor
 Volume=%h/.config/podman-watchguard/watchguard.json:/app/config/watchguard.json:ro
 Exec=--config /app/config/watchguard.json
 AutoUpdate=local
+# Hardware mode: reed switch (GPIO) and INA219 (I2C). The "-" prefix skips a
+# device that does not exist, so simulation mode still starts anywhere.
+AddDevice=-/dev/gpiochip0
+AddDevice=-/dev/i2c-1
+# Rootless access to those nodes through the host user's gpio and i2c groups
+# (needs crun). The DHT22 is read from sysfs, which needs no device.
+GroupAdd=keep-groups
 
 [Service]
 Restart=always
