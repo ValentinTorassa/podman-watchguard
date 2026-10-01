@@ -7,6 +7,7 @@ The academic design document is available in:
 - [Markdown](docs/proyecto.md)
 - [PDF](docs/proyecto.pdf)
 - [Test report](docs/test-report.md)
+- [Where the report and the code disagree](docs/paper-vs-code.md) (Spanish), with suggested corrections
 
 ## Status
 
