@@ -108,7 +108,7 @@ Si el informe nombra la carpeta `gitops-agent/`, conviene aclarar que contiene e
 
 **Aplicado (2026-10-01):** la linea 77 quedo con el texto sugerido, y en la linea 85, que nombra `gitops-agent/watchguard_monitor.py`, se agrego: "Pese al nombre, la carpeta `gitops-agent/` contiene solo el monitor, no un agente GitOps."
 
-## 8. La prueba con Podman nunca corrio
+## 8. La prueba con Podman no habia corrido (corrio el 2026-10-01)
 
 **Informe:** linea 182: "La prueba con Podman construye la imagen `podman-watchguard-monitor:local` y ejecuta tres iteraciones del monitor con sensores simulados."
 
@@ -129,9 +129,9 @@ Si el informe nombra la carpeta `gitops-agent/`, conviene aclarar que contiene e
 - `podman build -t podman-watchguard-monitor:local -f containers/monitor/Containerfile .`: los 7 pasos terminaron bien (instalo `gpiod` 2.5.0 y `smbus2` 0.6.1), imagen de 133 MB, codigo de salida 0.
 - `podman run --rm -v ./config:/config:ro podman-watchguard-monitor:local --config /config/watchguard.example.json --iterations 3`: tres eventos JSON, uno cada 2 s, y codigo de salida 0. Con la simulacion de la configuracion de ejemplo (36.2 a 36.7 °C, 60.5 a 61.9 % de humedad, 5.03 a 5.05 V, 422 a 435 mA) los tres muestran ventilador encendido, LED azul, buzzer y rele apagados, y ninguna alerta.
 
-Esto prueba la imagen y el flujo con contenedores, no el hardware ni el despliegue con quadlets: no corrio en la Raspberry Pi, ni sobre arm64, ni con Podman rootless. En `docs/proyecto.md` la linea 182 ahora registra esta corrida, y se aplico la correccion de la linea 166, con dos items nuevos en la lista para las pruebas de hardware y de control. `docs/test-report.md` no se modifico: su registro del 2026-05-04 en macOS sigue siendo correcto para esa fecha.
+Esto prueba la imagen y el flujo con contenedores, no el hardware ni el despliegue con quadlets: no corrio en la Raspberry Pi, ni sobre arm64, ni con Podman rootless. En `docs/proyecto.md` la linea 182 ahora registra esta corrida, y se aplico la correccion de la linea 166, con dos items nuevos en la lista para las pruebas de hardware y de control. `docs/test-report.md` se actualizo el 2026-10-04: registra esta corrida y las 51 pruebas de las tres suites, y conserva el registro del 2026-05-04 en macOS, correcto para esa fecha.
 
-## 9. Buzzer: el codigo no genera PWM y el buzzer de la lista es pasivo
+## 9. Buzzer: el codigo no genera PWM y el buzzer de la lista era pasivo (resuelto: buzzer activo)
 
 **Informe:** linea 127 ("Salida PWM mediante transistor"), linea 64 de la lista de materiales y referencia de la linea 202 (Adafruit 160, USD 1.50).
 
